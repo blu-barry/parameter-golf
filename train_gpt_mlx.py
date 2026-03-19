@@ -52,6 +52,7 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_progress_seconds: float = float(os.environ.get("VAL_PROGRESS_SECONDS", 5.0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -76,6 +77,10 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    attn_sparsity: float = float(os.environ.get("ATTN_SPARSITY", 0.0))
+    mlp_sparsity: float = float(os.environ.get("MLP_SPARSITY", 0.0))
+    sparse_min_keep: int = int(os.environ.get("SPARSE_MIN_KEEP", 4))
+    sparsity_anneal_frac: float = float(os.environ.get("SPARSITY_ANNEAL_FRAC", 0.5))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -167,6 +172,81 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+
+
+def annealed_sparsity(target_sparsity: float, step: int, iterations: int, anneal_frac: float) -> float:
+    if target_sparsity <= 0.0:
+        return 0.0
+    if not 0.0 <= target_sparsity < 1.0:
+        raise ValueError(f"target sparsity must be in [0, 1), got {target_sparsity}")
+    if anneal_frac <= 0.0:
+        return target_sparsity
+    anneal_steps = max(int(round(iterations * anneal_frac)), 1)
+    return target_sparsity * min(step / anneal_steps, 1.0)
+
+
+def target_matrix_sparsity(name: str, args: Hyperparameters, step: int) -> float:
+    if ".attn." in name:
+        return annealed_sparsity(args.attn_sparsity, step, args.iterations, args.sparsity_anneal_frac)
+    if ".mlp." in name:
+        return annealed_sparsity(args.mlp_sparsity, step, args.iterations, args.sparsity_anneal_frac)
+    return 0.0
+
+
+def prune_array_to_sparsity(arr: mx.array, sparsity: float, min_keep: int) -> tuple[mx.array, int]:
+    if arr.ndim != 2:
+        raise ValueError(f"Expected a matrix weight, got ndim={arr.ndim}")
+    total = int(arr.size)
+    if sparsity <= 0.0:
+        return arr, total
+    if min_keep <= 0:
+        raise ValueError(f"sparse_min_keep must be positive, got {min_keep}")
+
+    arr_np = _np_float32(arr)
+    out_features, in_features = arr_np.shape
+    keep_total = min(total, max(out_features * min_keep, int(round((1.0 - sparsity) * total))))
+    if keep_total >= total:
+        return arr, total
+
+    scores = np.abs(arr_np)
+    mask = np.zeros_like(scores, dtype=np.bool_)
+    row_keep = min(in_features, min_keep)
+    base_kept = 0
+    if row_keep > 0:
+        row_idx = np.argpartition(scores, in_features - row_keep, axis=1)[:, -row_keep:]
+        rows = np.arange(out_features)[:, None]
+        mask[rows, row_idx] = True
+        base_kept = out_features * row_keep
+
+    remaining_keep = keep_total - base_kept
+    if remaining_keep > 0:
+        remaining_scores = np.where(mask, -1.0, scores)
+        flat_idx = np.argpartition(remaining_scores.reshape(-1), total - remaining_keep)[-remaining_keep:]
+        mask.reshape(-1)[flat_idx] = True
+
+    pruned = np.where(mask, arr_np, 0.0)
+    return mx.array(pruned, dtype=arr.dtype), keep_total
+
+
+def apply_weight_sparsity(
+    params: dict[str, mx.array],
+    matrix_keys: list[str],
+    args: Hyperparameters,
+    step: int,
+) -> tuple[dict[str, mx.array], int, int, int]:
+    sparse_updates: dict[str, mx.array] = {}
+    sparse_tensors = 0
+    kept = 0
+    total = 0
+    for key in matrix_keys:
+        sparsity = target_matrix_sparsity(key, args, step)
+        if sparsity <= 0.0:
+            continue
+        sparse_tensors += 1
+        total += int(params[key].size)
+        sparse_updates[key], key_kept = prune_array_to_sparsity(params[key], sparsity, args.sparse_min_keep)
+        kept += key_kept
+    return sparse_updates, sparse_tensors, kept, total
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -512,7 +592,7 @@ class SplitOptimizers:
             bias_correction=True,
         )
 
-    def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
+    def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> tuple[int, int, int]:
         params = dict(tree_flatten(model.parameters()))
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
@@ -532,7 +612,15 @@ class SplitOptimizers:
         scalar_params = {k: params[k] for k in self.scalar_keys}
         updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
 
+        sparse_updates, sparse_tensors, sparse_kept, sparse_total = apply_weight_sparsity(
+            updated,
+            self.matrix_keys,
+            self.args,
+            step + 1,
+        )
+        updated.update(sparse_updates)
         model.update(tree_unflatten(list(updated.items())))
+        return sparse_tensors, sparse_kept, sparse_total
 
 # ==============================================================================
 # QUANTIZATION (INT8 + ZLIB)
@@ -759,6 +847,8 @@ def eval_val(
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
+    log_fn: Callable[[str], None] | None = None,
+    progress_label: str = "val",
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -772,10 +862,15 @@ def eval_val(
         )
     val_batch_seqs = val_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_loss = mx.array(0.0, dtype=mx.float32)
-    total_tokens = 0.0
-    total_bytes = 0.0
-    for batch_seq_start in range(0, total_seqs, val_batch_seqs):
+    total_chunks = max(math.ceil(total_seqs / val_batch_seqs), 1)
+    total_loss_weighted = np.float64(0.0)
+    total_tokens = np.float64(0.0)
+    total_bytes = np.float64(0.0)
+    eval_t0 = time.perf_counter()
+    next_progress_t = eval_t0 + args.val_progress_seconds
+    if log_fn is not None:
+        log_fn(f"{progress_label}_eval_start chunks:{total_chunks}")
+    for chunk_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -784,8 +879,11 @@ def eval_val(
         y_np = chunk[1:].reshape(-1, args.train_seq_len)
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
-        chunk_token_count = float(y.size)
-        total_loss = total_loss + compiled_loss(x, y).astype(mx.float32) * chunk_token_count
+        chunk_token_count = np.float64(y.size)
+        # Force each chunk immediately so validation memory stays bounded.
+        chunk_loss = compiled_loss(x, y).astype(mx.float32)
+        mx.eval(chunk_loss)
+        total_loss_weighted += np.float64(chunk_loss.item()) * chunk_token_count
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
@@ -793,12 +891,21 @@ def eval_val(
             has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
         ).astype(np.int16, copy=False)
         total_tokens += chunk_token_count
-        total_bytes += float(bytes_np.astype(np.float64).sum())
-    total_loss = total_loss / total_tokens
-    mx.eval(total_loss)
-    val_loss = float(total_loss.item())
+        total_bytes += np.float64(bytes_np.astype(np.float64).sum())
+        if log_fn is not None and args.val_progress_seconds > 0.0:
+            now = time.perf_counter()
+            if chunk_idx == 1 or chunk_idx == total_chunks or now >= next_progress_t:
+                log_fn(
+                    f"{progress_label}_progress chunk:{chunk_idx}/{total_chunks} "
+                    f"pct:{100.0 * chunk_idx / total_chunks:.1f} "
+                    f"elapsed:{now - eval_t0:.1f}s"
+                )
+                next_progress_t = now + args.val_progress_seconds
+    if log_fn is not None:
+        log_fn(f"{progress_label}_eval_done elapsed:{time.perf_counter() - eval_t0:.1f}s")
+    val_loss = float(total_loss_weighted / total_tokens)
     bits_per_token = val_loss / math.log(2.0)
-    val_bpb = bits_per_token * (total_tokens / total_bytes)
+    val_bpb = float(bits_per_token * float(total_tokens / total_bytes))
     return val_loss, val_bpb
 
 # -----------------------------
@@ -927,7 +1034,7 @@ def main() -> None:
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
-        f"val_batch_size:{args.val_batch_size} "
+        f"val_batch_size:{args.val_batch_size} val_progress_seconds:{args.val_progress_seconds:.1f} "
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
@@ -936,6 +1043,11 @@ def main() -> None:
         f"embed_lr:{args.tied_embed_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
+    )
+    log(
+        f"weight_sparsity:attn_target:{args.attn_sparsity:.4f} "
+        f"mlp_target:{args.mlp_sparsity:.4f} anneal_frac:{args.sparsity_anneal_frac:.3f} "
+        f"min_keep:{args.sparse_min_keep}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
@@ -999,6 +1111,8 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                log_fn=log,
+                progress_label="val",
             )
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             if step % 25 == 0 or last_step:
@@ -1026,7 +1140,7 @@ def main() -> None:
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
-        opt.step(model, grads, step=step, lr_mul=lr_mul)
+        sparse_tensors, sparse_kept, sparse_total = opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
@@ -1034,9 +1148,13 @@ def main() -> None:
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
+            sparse_suffix = (
+                f" sparse_density:{sparse_kept / max(sparse_total, 1):.6f}" if sparse_tensors > 0 else ""
+            )
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"{sparse_suffix}"
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
@@ -1078,6 +1196,8 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        log_fn=log,
+        progress_label="final_val",
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
