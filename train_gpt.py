@@ -69,6 +69,10 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    attn_sparsity = float(os.environ.get("ATTN_SPARSITY", 0.0))
+    mlp_sparsity = float(os.environ.get("MLP_SPARSITY", 0.0))
+    sparse_min_keep = int(os.environ.get("SPARSE_MIN_KEEP", 4))
+    sparsity_anneal_frac = float(os.environ.get("SPARSITY_ANNEAL_FRAC", 0.5))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -85,6 +89,78 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+
+def annealed_sparsity(target_sparsity: float, step: int, iterations: int, anneal_frac: float) -> float:
+    if target_sparsity <= 0.0:
+        return 0.0
+    if not 0.0 <= target_sparsity < 1.0:
+        raise ValueError(f"target sparsity must be in [0, 1), got {target_sparsity}")
+    if anneal_frac <= 0.0:
+        return target_sparsity
+    anneal_steps = max(int(round(iterations * anneal_frac)), 1)
+    return target_sparsity * min(step / anneal_steps, 1.0)
+
+
+def target_matrix_sparsity(name: str, args: Hyperparameters, step: int) -> float:
+    if ".attn." in name:
+        return annealed_sparsity(args.attn_sparsity, step, args.iterations, args.sparsity_anneal_frac)
+    if ".mlp." in name:
+        return annealed_sparsity(args.mlp_sparsity, step, args.iterations, args.sparsity_anneal_frac)
+    return 0.0
+
+
+@torch.no_grad()
+def prune_tensor_to_sparsity(param: Tensor, sparsity: float, min_keep: int) -> int:
+    if param.ndim != 2:
+        raise ValueError(f"Expected a matrix parameter, got ndim={param.ndim}")
+    total = int(param.numel())
+    if sparsity <= 0.0:
+        return total
+    if min_keep <= 0:
+        raise ValueError(f"sparse_min_keep must be positive, got {min_keep}")
+
+    out_features, in_features = param.shape
+    keep_total = min(total, max(out_features * min_keep, int(round((1.0 - sparsity) * total))))
+    if keep_total >= total:
+        return total
+
+    scores = param.abs()
+    mask = torch.zeros_like(scores, dtype=torch.bool)
+    row_keep = min(in_features, min_keep)
+    base_kept = 0
+    if row_keep > 0:
+        row_idx = torch.topk(scores, k=row_keep, dim=1, largest=True, sorted=False).indices
+        mask.scatter_(1, row_idx, True)
+        base_kept = out_features * row_keep
+
+    remaining_keep = keep_total - base_kept
+    if remaining_keep > 0:
+        remaining_scores = scores.masked_fill(mask, -1.0)
+        flat_idx = torch.topk(remaining_scores.reshape(-1), k=remaining_keep, largest=True, sorted=False).indices
+        mask.reshape(-1)[flat_idx] = True
+
+    param.mul_(mask)
+    return keep_total
+
+
+@torch.no_grad()
+def apply_weight_sparsity(
+    named_matrix_params: list[tuple[str, Tensor]],
+    args: Hyperparameters,
+    step: int,
+) -> tuple[int, int, int]:
+    sparse_tensors = 0
+    sparse_kept = 0
+    sparse_total = 0
+    for name, param in named_matrix_params:
+        sparsity = target_matrix_sparsity(name, args, step)
+        if sparsity <= 0.0:
+            continue
+        sparse_tensors += 1
+        sparse_total += int(param.numel())
+        sparse_kept += prune_tensor_to_sparsity(param, sparsity, args.sparse_min_keep)
+    return sparse_tensors, sparse_kept, sparse_total
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -849,11 +925,12 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
+    matrix_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_params = [p for _, p in matrix_named_params]
     scalar_params = [
         p
         for name, p in block_named_params
@@ -901,6 +978,11 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"weight_sparsity:attn_target:{args.attn_sparsity:.4f} "
+        f"mlp_target:{args.mlp_sparsity:.4f} anneal_frac:{args.sparsity_anneal_frac:.3f} "
+        f"min_keep:{args.sparse_min_keep}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1006,6 +1088,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        step_t0 = time.perf_counter()
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1031,6 +1114,11 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        sparse_tensors, sparse_kept, sparse_total = apply_weight_sparsity(
+            matrix_named_params,
+            args,
+            step + 1,
+        )
         zero_grad_all()
 
         step += 1
@@ -1040,9 +1128,18 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            torch.cuda.synchronize()
+            step_ms = 1000.0 * (time.perf_counter() - step_t0)
+            approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            tok_s = args.train_batch_tokens / max(step_ms / 1000.0, 1e-9)
+            sparse_suffix = (
+                f" sparse_density:{sparse_kept / max(sparse_total, 1):.6f}" if sparse_tensors > 0 else ""
+            )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"tok_s:{tok_s:.0f}"
+                f"{sparse_suffix}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
