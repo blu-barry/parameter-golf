@@ -314,6 +314,7 @@ def export_shards(
     num_val_docs: int,
     shard_size: int,
     docs_total: int,
+    max_train_tokens: int | None = None,
 ) -> dict[str, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for pattern in ("fineweb_train_*.bin", "fineweb_val_*.bin"):
@@ -357,6 +358,9 @@ def export_shards(
         for text, encoded in zip(texts, encoded_docs, strict=True):
             del text
             split_for_doc = "val" if stats["docs_total"] < num_val_docs else "train"
+            if split_for_doc == "train" and max_train_tokens is not None and stats["tokens_train"] >= max_train_tokens:
+                flush()
+                return stats
             if split_for_doc != split:
                 flush()
                 split = split_for_doc
@@ -370,7 +374,17 @@ def export_shards(
             if not ((0 <= toks).all() and (toks < vocab_size).all()):
                 bad = int(toks[(toks < 0) | (toks >= vocab_size)][0])
                 raise ValueError(f"token id {bad} outside declared vocab_size={vocab_size}")
+            if split_for_doc == "train" and max_train_tokens is not None:
+                remaining_train_tokens = max_train_tokens - stats["tokens_train"]
+                if remaining_train_tokens <= 0:
+                    flush()
+                    return stats
+                if len(toks) > remaining_train_tokens:
+                    toks = toks[:remaining_train_tokens]
             toks = toks.astype("<u2", copy=False)
+            if toks.size == 0:
+                flush()
+                return stats
 
             stats["docs_total"] += 1
             stats[f"docs_{split}"] += 1
@@ -390,7 +404,7 @@ def export_shards(
             print(f"{output_dir.name}: {stats['docs_total']}/{docs_total} docs", flush=True)
 
     flush()
-    if stats["docs_total"] != docs_total:
+    if max_train_tokens is None and stats["docs_total"] != docs_total:
         raise ValueError(f"expected {docs_total} docs, exported {stats['docs_total']}")
     return stats
 
@@ -501,6 +515,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Limit the number of docs used for tokenizer training.",
     )
+    parser.add_argument(
+        "--max-train-shards",
+        type=int,
+        default=None,
+        help="Optionally stop exporting after this many train shards worth of tokens.",
+    )
     parser.add_argument("--skip-byte", action="store_true", help="Skip byte-tokenizer export.")
     parser.add_argument(
         "--reuse-sp-model",
@@ -592,6 +612,7 @@ def main() -> None:
     for tok in tokenizers:
         output_dir = datasets_dir / tok["dataset_name"]
         print(f"Exporting dataset: {tok['dataset_name']}", flush=True)
+        max_train_tokens = None if args.max_train_shards is None else int(args.max_train_shards) * int(args.chunk_tokens)
         stats = export_shards(
             docs_jsonl,
             tok,
@@ -599,6 +620,7 @@ def main() -> None:
             num_val_docs=num_val_docs,
             shard_size=int(args.chunk_tokens),
             docs_total=docs_total,
+            max_train_tokens=max_train_tokens,
         )
         manifest["tokenizers"].append(tok["manifest"])
         manifest["datasets"].append(

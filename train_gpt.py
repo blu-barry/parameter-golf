@@ -30,18 +30,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# Default attempt-2 run:
+# - still the same simple baseline architecture unless you override env vars
+# - but now the default tokenizer stack is SP8192 instead of SP1024
+# - the biggest conceptual change is that token ids now live in [0, 8191]
+# - this makes the embedding table and final logits wider along the vocab axis
+# - sequence length is still 1024 by default; only the tokenizer/vocab changed here
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    # With SP8192, each token id is an integer in [0, 8191].
+    # Dataset shard dtype is still uint16 on disk, so the binary format does not need to change.
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -60,7 +63,10 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    # Shape impact of SP8192:
+    # - token embedding table: [8192, model_dim] instead of [1024, model_dim]
+    # - tied output projection: [batch * seq_len, 8192] logits instead of [batch * seq_len, 1024]
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -94,18 +100,72 @@ class Hyperparameters:
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    """
+    Approximate the orthogonal factor of a 2D matrix with a quintic Newton-Schulz iteration.
+
+    In Muon, `G` is typically a matrix-shaped gradient update. Rather than using the raw
+    gradient directly, we repeatedly transform it toward a matrix whose rows are close to
+    orthonormal. Intuitively, this preserves the main directional structure of the update
+    while removing most of the per-direction scale imbalance.
+
+    The "zeropower" name comes from the fact that this behaves like taking a matrix to the
+    power 0 in the singular value sense: singular vectors are kept, while singular values
+    are driven toward 1 (for nonzero modes). This is a fast approximation to the polar
+    factor / orthogonalization step, and is much cheaper than an exact SVD.
+
+    Shape notes:
+    - Input:  `G` with shape [m, n]
+    - Output: same shape [m, n]
+    - Internally we may transpose to keep the working matrix "wide" (m <= n), so the
+      Gram matrix `A = X @ X.T` is the smaller square matrix [m, m]. That reduces both
+      compute and memory when the original matrix is tall.
+    """
+    # These constants define the particular 5th-order Newton-Schulz polynomial update used
+    # by Muon. They are chosen so that repeated application pushes singular values toward 1
+    # over the range we care about after normalization.
     a, b, c = (3.4445, -4.7750, 2.0315)
+
+    # Run the iteration in bfloat16 for speed. This is usually sufficient because the goal
+    # is only to obtain a good-enough orthogonalized update, not a numerically exact factor.
     X = G.bfloat16()
+
+    # Normalize the matrix to keep the iteration in its stable convergence regime.
+    # `eps` prevents division by zero when `G` is extremely small or exactly zero.
     X /= X.norm() + eps
+
+    # If the matrix is taller than it is wide, transpose it so the working matrix has fewer
+    # rows than columns. The iteration only needs the row Gram matrix `X @ X.T`, so this
+    # makes the expensive square object as small as possible.
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
+
+    # Each step applies a polynomial in the Gram matrix A = X X^T to X itself:
+    #
+    #   X <- (a I + b A + c A^2) X
+    #
+    # If X = U S V^T is the SVD, then this update leaves U and V aligned while transforming
+    # each singular value s by the scalar polynomial:
+    #
+    #   s <- (a + b s^2 + c s^4) s
+    #
+    # Repeating this drives nonzero singular values toward 1, making X increasingly
+    # orthogonal without explicitly computing an SVD.
     for _ in range(steps):
+        # A is the row Gram matrix. If X has shape [m, n], then A has shape [m, m].
+        # When X is near-orthogonal, A is near the identity.
         A = X @ X.T
+
+        # Build the higher-order correction term b*A + c*A^2. Grouping it this way avoids
+        # materializing the identity matrix explicitly in the update formula.
         B = b * A + c * A @ A
+
+        # Apply the polynomial map to X. The `a * X` term is the linear part, and `B @ X`
+        # supplies the nonlinear correction that sharpens the singular values toward 1.
         X = a * X + B @ X
+
+    # Undo the earlier transpose so callers always receive a tensor with the same shape
+    # orientation as the input gradient matrix.
     return X.T if transposed else X
 
 
@@ -182,6 +242,9 @@ def build_sentencepiece_luts(
 ) -> tuple[Tensor, Tensor, Tensor]:
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
+    # shape: [table_size]
+    # Each lookup table is indexed by token id.
+    # For SP8192, table_size will usually be 8192.
     base_bytes_np = np.zeros((table_size,), dtype=np.int16)
     has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
     is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
@@ -209,10 +272,14 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
+    # Each shard contributes a 1D tensor of token ids with shape: [num_tokens_in_shard]
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    # shape: [total_val_tokens]
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+    # We keep one extra token so we can form x=t[:-1] and y=t[1:].
+    # shape: [usable + 1]
     return tokens[: usable + 1]
 
 
@@ -231,6 +298,10 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    # Dimension legend used below:
+    # - B = batch size in sequences on this rank
+    # - T = train_seq_len
+    # - V = vocab_size
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -253,8 +324,12 @@ def eval_val(
             raw_start = batch_seq_start * args.train_seq_len
             raw_end = batch_seq_end * args.train_seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            # local shape: [B*T + 1]
+            # Values are token ids in [0, vocab_size - 1], so for SP8192 that is [0, 8191].
             x = local[:-1].reshape(-1, args.train_seq_len)
+            # x shape: [B, T]
             y = local[1:].reshape(-1, args.train_seq_len)
+            # y shape: [B, T]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
@@ -440,6 +515,8 @@ def load_data_shard(file: Path) -> Tensor:
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
+    # shape: [N_tokens]
+    # dtype on disk is uint16, which is enough for SP8192 token ids.
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
@@ -477,6 +554,9 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
+    # Dimension legend used below:
+    # - B = local batch size in sequences for this rank
+    # - T = seq_len
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -487,10 +567,14 @@ class DistributedTokenLoader:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
+        # chunk shape: [world_size * (local_tokens + 1)]
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        # local shape: [B*T + 1]
         x = local[:-1].reshape(-1, seq_len)
+        # x shape: [B, T]
         y = local[1:].reshape(-1, seq_len)
+        # y shape: [B, T]
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
@@ -547,9 +631,19 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    # Dimension legend:
+    # - B = batch size
+    # - H = number of attention heads
+    # - T = sequence length
+    # - Dh = head_dim = model_dim / num_heads
+    #
+    # x shape: [B, H, T, Dh]
+    # cos/sin shape: [1, 1, T, Dh/2]
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
+    # x1/x2 shape: [B, H, T, Dh/2]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    # output shape: [B, H, T, Dh]
 
 
 class CausalSelfAttention(nn.Module):
@@ -582,9 +676,21 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
+        # Dimension legend:
+        # - B = batch size
+        # - T = sequence length
+        # - D = model_dim
+        # - Hq = num_heads
+        # - Hkv = num_kv_heads
+        # - Dh = head_dim = D / Hq
+        #
+        # x shape: [B, T, D]
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        # q shape: [B, Hq, T, Dh]
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # k shape: [B, Hkv, T, Dh]
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # v shape: [B, Hkv, T, Dh]
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -599,8 +705,11 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # y shape after attention: [B, Hq, T, Dh]
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        # y shape after merge heads: [B, T, D]
         return self.proj(y)
+        # output shape: [B, T, D]
 
 
 class MLP(nn.Module):
@@ -613,8 +722,17 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        # Dimension legend:
+        # - B = batch size
+        # - T = sequence length
+        # - D = model_dim
+        # - M = mlp_mult * D
+        #
+        # x shape: [B, T, D]
         x = torch.relu(self.fc(x))
+        # x shape after fc: [B, T, M]
         return self.proj(x.square())
+        # output shape: [B, T, D]
 
 
 class Block(nn.Module):
@@ -637,11 +755,21 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        # Dimension legend:
+        # - B = batch size
+        # - T = sequence length
+        # - D = model_dim
+        #
+        # x shape: [B, T, D]
+        # x0 shape: [B, T, D]
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # x shape: [B, T, D]
         attn_out = self.attn(self.attn_norm(x))
+        # attn_out shape: [B, T, D]
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        # output shape: [B, T, D]
         return x
 
 
@@ -699,6 +827,16 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        # Dimension legend:
+        # - B = batch size
+        # - T = sequence length
+        # - D = model_dim
+        # - V = vocab_size
+        #
+        # input_ids shape: [B, T]
+        # tok_emb.weight shape: [V, D]
+        # x shape after embedding lookup: [B, T, D]
+        # The SP8192 change shows up here because V is now 8192 by default.
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -707,20 +845,27 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
+            # skips stores tensors of shape: [B, T, D]
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                # skip_weights[i] shape: [D], broadcast to [B, T, D]
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
+        # x shape after flattening batch and time: [B*T, D]
         targets = target_ids.reshape(-1)
+        # targets shape: [B*T]
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        # logits_proj shape: [B*T, V]
+        # With SP8192 this is [B*T, 8192].
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        # logits shape: [B*T, V]
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -818,6 +963,10 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"tokenizer_setup:vocab_size:{args.vocab_size} "
+        f"embedding_table_shape:[{args.vocab_size},{args.model_dim}]"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
